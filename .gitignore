@@ -10,5 +10,6 @@ afl_findings_dir/
 *.xcworkspacedata
 *.xcuserstate
 *.xccheckout
+*.xcscmblueprint
 xcuserdata
 build
