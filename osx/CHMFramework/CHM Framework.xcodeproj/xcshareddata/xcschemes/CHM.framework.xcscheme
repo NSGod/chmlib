@@ -17,7 +17,7 @@
                BlueprintIdentifier = "8DC2EF4F0486A6940098B216"
                BuildableName = "CHM.framework"
                BlueprintName = "CHM.framework"
-               ReferencedContainer = "container:CHM.xcodeproj">
+               ReferencedContainer = "container:CHM Framework.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -48,7 +48,7 @@
             BlueprintIdentifier = "8DC2EF4F0486A6940098B216"
             BuildableName = "CHM.framework"
             BlueprintName = "CHM.framework"
-            ReferencedContainer = "container:CHM.xcodeproj">
+            ReferencedContainer = "container:CHM Framework.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
       <AdditionalOptions>
@@ -66,7 +66,7 @@
             BlueprintIdentifier = "8DC2EF4F0486A6940098B216"
             BuildableName = "CHM.framework"
             BlueprintName = "CHM.framework"
-            ReferencedContainer = "container:CHM.xcodeproj">
+            ReferencedContainer = "container:CHM Framework.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
    </ProfileAction>
