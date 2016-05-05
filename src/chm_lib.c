@@ -29,6 +29,8 @@
  *              a deal, at least until CHM v4 (MS .lit files), which also  *
  *              incorporate encryption, of some description.               *
  *                                                                         *
+ * switches:    CHM_MT:        compile library with thread-safety          *
+ *                                                                         *
  * switches (Linux only):                                                  *
  *              CHM_USE_PREAD: compile library to use pread instead of     *
  *                             lseek/read                                  *
@@ -46,6 +48,7 @@
  *                                                                         *
  ***************************************************************************/
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
@@ -67,7 +70,42 @@
 #endif
 
 #include "chm_lib.h"
+
+#ifdef CHM_MT
+#define _REENTRANT
+#endif
+
 #include "lzx.h"
+
+/* includes/defines for threading, if using them */
+#ifdef CHM_MT
+#ifdef WIN32
+#define CHM_ACQUIRE_LOCK(a)         \
+    do {                            \
+        EnterCriticalSection(&(a)); \
+    } while (0)
+#define CHM_RELEASE_LOCK(a)         \
+    do {                            \
+        LeaveCriticalSection(&(a)); \
+    } while (0)
+
+#else
+#include <pthread.h>
+
+#define CHM_ACQUIRE_LOCK(a)       \
+    do {                          \
+        pthread_mutex_lock(&(a)); \
+    } while (0)
+#define CHM_RELEASE_LOCK(a)         \
+    do {                            \
+        pthread_mutex_unlock(&(a)); \
+    } while (0)
+
+#endif
+#else
+#define CHM_ACQUIRE_LOCK(a) /* do nothing */
+#define CHM_RELEASE_LOCK(a) /* do nothing */
+#endif
 
 #ifdef WIN32
 #define CHM_NULL_FD INVALID_HANDLE_VALUE
@@ -531,6 +569,18 @@ struct chmFile {
     int fd;
 #endif
 
+#ifdef CHM_MT
+#ifdef WIN32
+    CRITICAL_SECTION mutex;
+    CRITICAL_SECTION lzx_mutex;
+    CRITICAL_SECTION cache_mutex;
+#else
+    pthread_mutex_t mutex;
+    pthread_mutex_t lzx_mutex;
+    pthread_mutex_t cache_mutex;
+#endif
+#endif
+
     uint64_t dir_offset;
     uint64_t dir_len;
     uint64_t data_offset;
@@ -565,10 +615,15 @@ struct chmFile {
 
 /* utility function to handle differences between {pread,read}(64)? */
 static int64_t _chm_fetch_bytes(struct chmFile* h, uint8_t* buf, uint64_t os, int64_t len) {
-    int64_t readLen = 0, oldOs = 0;
-    if (h->fd == CHM_NULL_FD)
+	int64_t readLen = 0;
+#ifndef CHM_USE_PREAD
+	int64_t oldOs = 0;
+#endif
+	
+	if (h->fd == CHM_NULL_FD)
         return readLen;
 
+    CHM_ACQUIRE_LOCK(h->mutex);
 #ifdef CHM_USE_WIN32IO
     /* NOTE: this might be better done with CreateFileMapping, et cetera... */
     {
@@ -612,6 +667,7 @@ static int64_t _chm_fetch_bytes(struct chmFile* h, uint8_t* buf, uint64_t os, in
 #endif
 #endif
 #endif
+    CHM_RELEASE_LOCK(h->mutex);
     return readLen;
 }
 
@@ -665,6 +721,19 @@ struct chmFile* chm_open(const char* filename)
         free(newHandle);
         return NULL;
     }
+#endif
+
+/* initialize mutexes, if needed */
+#ifdef CHM_MT
+#ifdef WIN32
+    InitializeCriticalSection(&newHandle->mutex);
+    InitializeCriticalSection(&newHandle->lzx_mutex);
+    InitializeCriticalSection(&newHandle->cache_mutex);
+#else
+    pthread_mutex_init(&newHandle->mutex, NULL);
+    pthread_mutex_init(&newHandle->lzx_mutex, NULL);
+    pthread_mutex_init(&newHandle->cache_mutex, NULL);
+#endif
 #endif
 
     /* read and verify header */
@@ -797,6 +866,18 @@ void chm_close(struct chmFile* h) {
             CHM_CLOSE_FILE(h->fd);
         h->fd = CHM_NULL_FD;
 
+#ifdef CHM_MT
+#ifdef WIN32
+        DeleteCriticalSection(&h->mutex);
+        DeleteCriticalSection(&h->lzx_mutex);
+        DeleteCriticalSection(&h->cache_mutex);
+#else
+        pthread_mutex_destroy(&h->mutex);
+        pthread_mutex_destroy(&h->lzx_mutex);
+        pthread_mutex_destroy(&h->cache_mutex);
+#endif
+#endif
+
         if (h->lzx_state)
             LZXteardown(h->lzx_state);
         h->lzx_state = NULL;
@@ -831,6 +912,7 @@ void chm_close(struct chmFile* h) {
 void chm_set_param(struct chmFile* h, int paramType, int paramVal) {
     switch (paramType) {
         case CHM_PARAM_MAX_BLOCKS_CACHED:
+            CHM_ACQUIRE_LOCK(h->cache_mutex);
             if (paramVal != h->cache_num_blocks) {
                 uint8_t** newBlocks;
                 uint64_t* newIndices;
@@ -876,6 +958,7 @@ void chm_set_param(struct chmFile* h, int paramType, int paramVal) {
                 h->cache_block_indices = newIndices;
                 h->cache_num_blocks = paramVal;
             }
+            CHM_RELEASE_LOCK(h->cache_mutex);
             break;
 
         default:
@@ -1142,6 +1225,7 @@ static int _chm_get_cmpblock_bounds(struct chmFile* h, uint64_t block, uint64_t*
     return 1;
 }
 
+/* decompress the block.  must have lzx_mutex. */
 static int64_t _chm_decompress_block(struct chmFile* h, uint64_t block, uint8_t** ubuffer) {
     uint8_t* cbuffer = malloc(((unsigned int)h->reset_table.block_len + 6144));
     uint64_t cmpStart;                                           /* compressed start  */
@@ -1254,11 +1338,16 @@ static int64_t _chm_decompress_region(struct chmFile* h, uint8_t* buf, uint64_t 
         nLen = h->reset_table.block_len - nOffset;
 
     /* if block is cached, return data from it. */
+    CHM_ACQUIRE_LOCK(h->lzx_mutex);
+    CHM_ACQUIRE_LOCK(h->cache_mutex);
     if (h->cache_block_indices[nBlock % h->cache_num_blocks] == nBlock &&
         h->cache_blocks[nBlock % h->cache_num_blocks] != NULL) {
         memcpy(buf, h->cache_blocks[nBlock % h->cache_num_blocks] + nOffset, (unsigned int)nLen);
+        CHM_RELEASE_LOCK(h->cache_mutex);
+        CHM_RELEASE_LOCK(h->lzx_mutex);
         return nLen;
     }
+    CHM_RELEASE_LOCK(h->cache_mutex);
 
     /* data request not satisfied, so... start up the decompressor machine */
     if (!h->lzx_state) {
@@ -1271,11 +1360,13 @@ static int64_t _chm_decompress_region(struct chmFile* h, uint8_t* buf, uint64_t 
     gotLen = _chm_decompress_block(h, nBlock, &ubuffer);
     /* SumatraPDF: check return value */
     if (gotLen == (uint64_t)-1) {
+        CHM_RELEASE_LOCK(h->lzx_mutex);
         return 0;
     }
     if (gotLen < nLen)
         nLen = gotLen;
     memcpy(buf, ubuffer + nOffset, (unsigned int)nLen);
+    CHM_RELEASE_LOCK(h->lzx_mutex);
     return nLen;
 }
 
